@@ -283,30 +283,42 @@ _DASHBOARD_HTML = """\
 <tbody id="tbody"><tr><td colspan="5" class="empty">Loading&hellip;</td></tr></tbody>
 </table>
 <script>
-let activeFilter = '';
+let activeFilter = "";
 function statusClass(s) {
-  const m = {investigating:'investigating',identified:'identified',monitoring:'monitoring',resolved:'resolved'};
-  return m[s] || 'unknown';
+  var m = {investigating:"investigating",identified:"identified",monitoring:"monitoring",resolved:"resolved"};
+  return m[s] || "unknown";
 }
+function esc(s) { var d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
 async function load() {
-  const url = activeFilter ? '/api/incidents?page='+encodeURIComponent(activeFilter) : '/api/incidents';
-  const res = await fetch(url);
-  const data = await res.json();
-  const tbody = document.getElementById('tbody');
-  if (!data.length) { tbody.innerHTML='<tr><td colspan="5" class="empty">No incidents recorded yet.</td></tr>'; return; }
-  // pages for filter buttons
-  const pages = [...new Set(data.map(r=>r.page))].sort();
-  const fDiv = document.getElementById('filters');
-  fDiv.innerHTML = '<button class="'+(activeFilter?'':'active')+'" onclick="setFilter(\\'\\')">All</button>'
-    + pages.map(p=>'<button class="'+(activeFilter===p?'active':'')+'" onclick="setFilter(\\''+p.replace(/'/g,"\\\\'")+'\\'\\')">'+p+'</button>').join('');
-  tbody.innerHTML = data.map(r =>
-    '<tr><td>'+r.timestamp+'</td><td>'+r.page+'</td>'
-    +'<td><span class="badge badge-'+statusClass(r.status)+'">'+r.status+'</span></td>'
-    +'<td>'+r.incident+'</td>'
-    +'<td class="detail" title="'+(r.detail||'').replace(/"/g,'&quot;')+'">'+(r.detail||'—')+'</td></tr>'
-  ).join('');
+  var url = activeFilter ? "/api/incidents?page="+encodeURIComponent(activeFilter) : "/api/incidents";
+  var res = await fetch(url);
+  var data = await res.json();
+  var tbody = document.getElementById("tbody");
+  if (!data.length) { tbody.innerHTML = "<tr><td colspan='5' class='empty'>No incidents recorded yet.</td></tr>"; return; }
+  var pages = Array.from(new Set(data.map(function(r){return r.page}))).sort();
+  var fDiv = document.getElementById("filters");
+  fDiv.innerHTML = "";
+  var allBtn = document.createElement("button");
+  allBtn.textContent = "All";
+  if (!activeFilter) allBtn.className = "active";
+  allBtn.addEventListener("click", function(){ activeFilter = ""; load(); });
+  fDiv.appendChild(allBtn);
+  pages.forEach(function(p) {
+    var btn = document.createElement("button");
+    btn.textContent = p;
+    if (activeFilter === p) btn.className = "active";
+    btn.addEventListener("click", function(){ activeFilter = p; load(); });
+    fDiv.appendChild(btn);
+  });
+  var html = "";
+  data.forEach(function(r) {
+    html += "<tr><td>"+esc(r.timestamp)+"</td><td>"+esc(r.page)+"</td>"
+      +"<td><span class='badge badge-"+statusClass(r.status)+"'>"+esc(r.status)+"</span></td>"
+      +"<td>"+esc(r.incident)+"</td>"
+      +"<td class='detail' title='"+esc(r.detail||"")+"'>"+esc(r.detail||"—")+"</td></tr>";
+  });
+  tbody.innerHTML = html;
 }
-function setFilter(p) { activeFilter = p; load(); }
 load();
 </script>
 </body>
