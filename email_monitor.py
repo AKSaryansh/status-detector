@@ -308,6 +308,11 @@ _AGENT_MODELS = {
         "gemini-2.0-flash": "Flash 2.0",
         "gemini-2.5-pro-preview-06-05": "Gemini 2.5 Pro",
     },
+    "groq": {
+        "llama-3.3-70b-versatile": "Llama 3.3 70B",
+        "gemma2-9b-it": "Gemma 2 9B",
+        "mixtral-8x7b-32768": "Mixtral 8x7B",
+    },
 }
 
 
@@ -379,6 +384,30 @@ async def _call_openai(api_key: str, model: str, system: str, message: str) -> s
             return result["choices"][0]["message"]["content"]
 
 
+async def _call_groq(api_key: str, model: str, system: str, message: str) -> str:
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "max_tokens": 1024,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": message},
+                ],
+            },
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            result = await resp.json()
+            if resp.status != 200:
+                raise ValueError(result.get("error", {}).get("message", f"Groq API error (HTTP {resp.status})"))
+            return result["choices"][0]["message"]["content"]
+
+
 async def _call_gemini(api_key: str, model: str, system: str, message: str) -> str:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     async with aiohttp.ClientSession() as session:
@@ -435,6 +464,8 @@ async def _agent_query_handler(request: web.Request) -> web.Response:
             reply = await _call_anthropic(api_key, model, system, user_message)
         elif provider == "openai":
             reply = await _call_openai(api_key, model, system, user_message)
+        elif provider == "groq":
+            reply = await _call_groq(api_key, model, system, user_message)
         else:
             reply = await _call_gemini(api_key, model, system, user_message)
         return web.json_response({"reply": reply})
@@ -489,11 +520,11 @@ _DASHBOARD_HTML = """\
   .top-bar {
     background: var(--bg-secondary); border-bottom: 1px solid var(--border);
     padding: .6rem 1.5rem; display: flex; align-items: center; justify-content: space-between;
-    font-size: .7rem; color: var(--text-secondary);
+    font-size: .7rem; color: var(--text-secondary); overflow: visible; position: relative; z-index: 10;
   }
   .top-bar-left { display: flex; align-items: center; gap: 1.5rem; }
   .top-bar .sys-label { color: var(--accent); font-weight: 600; letter-spacing: .08em; }
-  .top-bar-nav { display: flex; gap: .3rem; }
+  .top-bar-nav { display: flex; gap: .3rem; overflow: visible; }
   .top-bar-nav a {
     color: var(--text-secondary); text-decoration: none; padding: .25rem .6rem;
     border: 1px solid transparent; border-radius: 2px; font-size: .65rem;
@@ -501,6 +532,61 @@ _DASHBOARD_HTML = """\
   }
   .top-bar-nav a:hover { border-color: var(--accent); color: var(--accent); }
   .top-bar-nav a.active { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+  .top-bar-nav a.agent-link {
+    position: relative; color: var(--accent); border-color: var(--accent);
+    animation: agentGlow 2.5s ease-in-out infinite;
+    overflow: visible;
+  }
+  /* Glowing border pulse */
+  .top-bar-nav a.agent-link::before {
+    content: ''; position: absolute; inset: -3px; border-radius: 4px;
+    border: 1px solid var(--accent); opacity: 0;
+    animation: agentRing 2.5s ease-in-out infinite;
+    pointer-events: none;
+  }
+  /* Bouncing arrow — sits below the button, points up */
+  .top-bar-nav a.agent-link .arrow-wrap {
+    position: absolute; left: 50%; bottom: -20px;
+    transform: translateX(-50%);
+    display: flex; flex-direction: column; align-items: center;
+    animation: arrowBounce 1.8s ease-in-out infinite;
+    pointer-events: none; z-index: 10;
+  }
+  .top-bar-nav a.agent-link .arrow-wrap svg {
+    filter: drop-shadow(0 0 5px rgba(0,229,255,0.7));
+  }
+  /* Trail particles below arrow */
+  .top-bar-nav a.agent-link .arrow-wrap::before,
+  .top-bar-nav a.agent-link .arrow-wrap::after {
+    content: ''; position: absolute; width: 4px; height: 4px;
+    border-radius: 50%; background: var(--accent);
+  }
+  .top-bar-nav a.agent-link .arrow-wrap::before {
+    bottom: -6px; left: calc(50% - 5px);
+    animation: particle 1.8s ease-in-out infinite;
+  }
+  .top-bar-nav a.agent-link .arrow-wrap::after {
+    bottom: -4px; left: calc(50% + 3px);
+    animation: particle 1.8s ease-in-out infinite .3s;
+  }
+  @keyframes agentGlow {
+    0%,100% { box-shadow: 0 0 4px rgba(0,229,255,0.15); }
+    50% { box-shadow: 0 0 14px rgba(0,229,255,0.5), 0 0 28px rgba(0,229,255,0.12); }
+  }
+  @keyframes agentRing {
+    0% { opacity: 0; transform: scale(1); }
+    50% { opacity: .6; transform: scale(1.15); }
+    100% { opacity: 0; transform: scale(1.3); }
+  }
+  @keyframes arrowBounce {
+    0%,100% { transform: translateX(-50%) translateY(0); }
+    50% { transform: translateX(-50%) translateY(4px); }
+  }
+  @keyframes particle {
+    0% { opacity: .8; transform: translateY(0) scale(1); }
+    50% { opacity: .3; transform: translateY(10px) scale(0.5); }
+    100% { opacity: 0; transform: translateY(16px) scale(0); }
+  }
   .pulse-dot {
     width: 6px; height: 6px; border-radius: 50%; background: var(--green);
     display: inline-block; margin-right: .4rem; animation: pulse 2s ease-in-out infinite;
@@ -657,7 +743,7 @@ _DASHBOARD_HTML = """\
   </div>
   <div class="top-bar-nav">
     <a href="/logs" class="active">DASHBOARD</a>
-    <a href="/agent">AGENT</a>
+    <a href="/agent" class="agent-link">AGENT<span class="arrow-wrap"><svg width="14" height="10" viewBox="0 0 14 10" fill="none"><path d="M7 0L13.5 7.5L12 9L7 3.5L2 9L0.5 7.5L7 0Z" fill="var(--accent)"/></svg></span></a>
   </div>
   <span class="clock" id="clock">--:--:-- UTC</span>
 </div>
@@ -809,6 +895,7 @@ _AGENT_HTML = """\
     --anthropic: #d97757; --anthropic-bg: rgba(217,119,87,0.08); --anthropic-border: rgba(217,119,87,0.35);
     --openai: #10a37f; --openai-bg: rgba(16,163,127,0.08); --openai-border: rgba(16,163,127,0.35);
     --gemini: #7b9cf7; --gemini-bg: rgba(123,156,247,0.08); --gemini-border: rgba(123,156,247,0.35);
+    --groq: #f55036; --groq-bg: rgba(245,80,54,0.08); --groq-border: rgba(245,80,54,0.35);
     --green: #34d399; --green-glow: rgba(52,211,153,0.3);
     --red: #f87171;
   }
@@ -881,11 +968,18 @@ _AGENT_HTML = """\
   .provider-card.sel-anthropic { border-color: var(--anthropic-border); background: var(--anthropic-bg); }
   .provider-card.sel-openai { border-color: var(--openai-border); background: var(--openai-bg); }
   .provider-card.sel-gemini { border-color: var(--gemini-border); background: var(--gemini-bg); }
+  .provider-card.sel-groq { border-color: var(--groq-border); background: var(--groq-bg); }
   .provider-card svg { width: 22px; height: 22px; flex-shrink: 0; }
   .provider-card .pname { font-size: .8rem; font-weight: 600; }
   .pname.c-anthropic { color: var(--anthropic); }
   .pname.c-openai { color: var(--openai); }
   .pname.c-gemini { color: var(--gemini); }
+  .pname.c-groq { color: var(--groq); }
+  .free-badge {
+    font-size: .5rem; font-weight: 700; color: var(--green); background: rgba(52,211,153,0.12);
+    border: 1px solid rgba(52,211,153,0.25); border-radius: 4px; padding: .1rem .35rem;
+    letter-spacing: .05em; text-transform: uppercase; margin-left: .3rem;
+  }
 
   /* Model select */
   .model-select {
@@ -950,6 +1044,7 @@ _AGENT_HTML = """\
   .msg-agent .msg-icon.ic-anthropic { background: var(--anthropic-bg); color: var(--anthropic); border: 1px solid var(--anthropic-border); }
   .msg-agent .msg-icon.ic-openai { background: var(--openai-bg); color: var(--openai); border: 1px solid var(--openai-border); }
   .msg-agent .msg-icon.ic-gemini { background: var(--gemini-bg); color: var(--gemini); border: 1px solid var(--gemini-border); }
+  .msg-agent .msg-icon.ic-groq { background: var(--groq-bg); color: var(--groq); border: 1px solid var(--groq-border); }
   .msg-agent .msg-icon.ic-system { background: var(--accent-dim); color: var(--accent); border: 1px solid var(--accent-border); }
 
   .msg-content { flex: 1; min-width: 0; }
@@ -1059,6 +1154,10 @@ _AGENT_HTML = """\
             <svg viewBox="0 0 24 24" fill="none"><path d="M12 24A14.304 14.304 0 0 0 0 12 14.304 14.304 0 0 0 12 0a14.304 14.304 0 0 0 0 12 14.304 14.304 0 0 0 0 12z" fill="url(#gem)"/><defs><linearGradient id="gem" x1="0" y1="12" x2="24" y2="12"><stop stop-color="#4285f4"/><stop offset=".5" stop-color="#9b72cb"/><stop offset="1" stop-color="#d96570"/></linearGradient></defs></svg>
             <span class="pname c-gemini">Gemini</span>
           </div>
+          <div class="provider-card" data-provider="groq" onclick="selectProvider('groq')">
+            <svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="var(--groq)" stroke-width="2.5" fill="none"/><circle cx="12" cy="12" r="4" fill="var(--groq)"/><path d="M12 8V2" stroke="var(--groq)" stroke-width="2" stroke-linecap="round"/></svg>
+            <span class="pname c-groq">Groq</span><span class="free-badge">FREE</span>
+          </div>
         </div>
       </div>
       <div class="setup-row">
@@ -1142,12 +1241,17 @@ var models = {
     {id:"o3-mini", name:"o3-mini", tier:"Reasoning", price:"$1.10 / 1M tokens"}
   ],
   gemini: [
-    {id:"gemini-2.0-flash-lite", name:"Flash-Lite 2.0", tier:"Budget", price:"Free tier"},
+    {id:"gemini-2.0-flash-lite", name:"Flash-Lite 2.0", tier:"Budget", price:"Free tier (API key required)"},
     {id:"gemini-2.0-flash", name:"Flash 2.0", tier:"Balanced", price:"$0.10 / 1M tokens"},
     {id:"gemini-2.5-pro-preview-06-05", name:"Gemini 2.5 Pro", tier:"Premium", price:"$1.25 / 1M tokens"}
+  ],
+  groq: [
+    {id:"llama-3.3-70b-versatile", name:"Llama 3.3 70B", tier:"Free", price:"Free (rate limited)"},
+    {id:"gemma2-9b-it", name:"Gemma 2 9B", tier:"Free", price:"Free (rate limited)"},
+    {id:"mixtral-8x7b-32768", name:"Mixtral 8x7B", tier:"Free", price:"Free (rate limited)"}
   ]
 };
-var iconLabels = {anthropic:"CL", openai:"OA", gemini:"GE"};
+var iconLabels = {anthropic:"CL", openai:"OA", gemini:"GE", groq:"GQ"};
 var currentProvider = "anthropic";
 
 function selectProvider(p) {
@@ -1163,7 +1267,15 @@ function selectProvider(p) {
     opt.textContent = m.name + "  —  " + m.tier + "  (" + m.price + ")";
     sel.appendChild(opt);
   });
-  document.getElementById("apiKeyInput").value = sessionStorage.getItem("agent_key_" + p) || "";
+  var keyInput = document.getElementById("apiKeyInput");
+  keyInput.value = sessionStorage.getItem("agent_key_" + p) || "";
+  var hints = {
+    anthropic: "sk-ant-... (from console.anthropic.com)",
+    openai: "sk-... (from platform.openai.com)",
+    gemini: "AIza... (from aistudio.google.com)",
+    groq: "gsk_... (free at console.groq.com)"
+  };
+  keyInput.placeholder = hints[p] || "Paste your API key here...";
 }
 document.getElementById("apiKeyInput").addEventListener("input", function() {
   sessionStorage.setItem("agent_key_" + currentProvider, this.value);
