@@ -19,6 +19,7 @@ import signal
 import sys
 from datetime import datetime, timedelta, timezone
 
+import aiohttp
 from aiohttp import web
 
 # ---------------------------------------------------------------------------
@@ -28,11 +29,19 @@ from aiohttp import web
 LOG_DIR = "logs"
 WEBHOOK_PORT = int(os.environ.get("PORT", 8081))
 MAX_RECENT = 200
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")  # optional server fallback
 
 # Subject pattern: [Page Name] Status - Incident Title
 _SUBJECT_RE = re.compile(
     r"\[(.+?)\]\s*(Investigating|Identified|Monitoring|Resolved|Update)\s*-\s*(.+)",
     re.IGNORECASE,
+)
+
+# Pattern to detect subscription confirmation emails
+_CONFIRM_RE = re.compile(r"confirm your subscription", re.IGNORECASE)
+# Extract confirmation URLs from email body
+_CONFIRM_URL_RE = re.compile(
+    r"https?://[^\s]+/subscriptions/confirm/[A-Za-z0-9_\-]+",
 )
 
 
@@ -45,6 +54,7 @@ def _sanitize(name: str) -> str:
 
 
 _recent_records: list[dict] = []
+_autoconfirm_log: list[dict] = []
 
 
 def _emit(record: dict, log_path: str) -> None:
@@ -61,6 +71,46 @@ def _emit(record: dict, log_path: str) -> None:
 def _log_stderr(msg: str) -> None:
     """Operational messages go to stderr so stdout stays pure JSON."""
     print(msg, file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Auto-confirm subscriptions
+# ---------------------------------------------------------------------------
+
+async def _auto_confirm(subject: str, text_body: str) -> None:
+    """Detect subscription confirmation emails and visit the confirm URL."""
+    if not _CONFIRM_RE.search(subject):
+        return
+
+    urls = _CONFIRM_URL_RE.findall(text_body or "")
+    if not urls:
+        _log_stderr(f"  [autoconfirm] confirmation email detected but no URL found: {subject}")
+        return
+
+    for url in urls:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    status = resp.status
+            entry = {
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "action": "auto_confirmed",
+                "subject": subject,
+                "url": url,
+                "http_status": status,
+            }
+            _autoconfirm_log.append(entry)
+            _log_stderr(f"  [autoconfirm] confirmed: {url} (HTTP {status})")
+        except Exception as e:
+            entry = {
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "action": "auto_confirm_failed",
+                "subject": subject,
+                "url": url,
+                "error": str(e),
+            }
+            _autoconfirm_log.append(entry)
+            _log_stderr(f"  [autoconfirm] FAILED: {url} — {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +249,9 @@ async def _email_webhook_handler(request: web.Request) -> web.Response:
     if not subject:
         return web.Response(status=200, text="ok (ignored, no subject)")
 
+    # Auto-confirm subscription emails (fire and forget)
+    asyncio.create_task(_auto_confirm(subject, text_body))
+
     # Dedup
     if _dedup.is_duplicate(subject):
         _log_stderr(f"  [email] duplicate suppressed: {subject}")
@@ -229,6 +282,178 @@ async def _api_incidents_handler(request: web.Request) -> web.Response:
         records = [r for r in records if r.get("page", "").lower() == page_filter]
     return web.json_response(records)
 
+
+async def _api_autoconfirm_handler(_request: web.Request) -> web.Response:
+    """Return auto-confirm log."""
+    return web.json_response(list(reversed(_autoconfirm_log)))
+
+
+# ---------------------------------------------------------------------------
+# AI Agent — multi-provider incident query interface
+# ---------------------------------------------------------------------------
+
+_AGENT_MODELS = {
+    "anthropic": {
+        "claude-haiku-4-5-20251001": "Haiku 4.5",
+        "claude-sonnet-4-5-20250514": "Sonnet 4.5",
+        "claude-opus-4-0-20250514": "Opus 4",
+    },
+    "openai": {
+        "gpt-4o-mini": "GPT-4o Mini",
+        "gpt-4o": "GPT-4o",
+        "o3-mini": "o3-mini",
+    },
+    "gemini": {
+        "gemini-2.0-flash-lite": "Flash-Lite 2.0",
+        "gemini-2.0-flash": "Flash 2.0",
+        "gemini-2.5-pro-preview-06-05": "Gemini 2.5 Pro",
+    },
+}
+
+
+def _build_system_prompt() -> str:
+    incidents = list(reversed(_recent_records))
+    incident_json = json.dumps(incidents[:100], indent=2, default=str)
+    return f"""You are an incident analysis agent for a status page monitoring system. You have access to the latest incident data ingested from email notifications from services like GitHub, AWS, Stripe, OpenAI, Vercel, Claude, Datadog, etc.
+
+Your job is to answer questions about these incidents concisely and technically. You can:
+- Summarize recent incidents
+- Filter by service/page name
+- Identify what broke and when
+- Track incident progression (investigating → identified → monitoring → resolved)
+- Provide timeline analysis
+- Highlight active (unresolved) incidents
+
+Be direct, technical, and use short responses. Format with markdown. If the data doesn't contain what the user asks about, say so clearly.
+
+Current incident data ({len(incidents)} records):
+```json
+{incident_json}
+```"""
+
+
+async def _call_anthropic(api_key: str, model: str, system: str, message: str) -> str:
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": model,
+                "max_tokens": 1024,
+                "system": system,
+                "messages": [{"role": "user", "content": message}],
+            },
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            result = await resp.json()
+            if resp.status != 200:
+                raise ValueError(result.get("error", {}).get("message", f"Anthropic API error (HTTP {resp.status})"))
+            return result["content"][0]["text"]
+
+
+async def _call_openai(api_key: str, model: str, system: str, message: str) -> str:
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "max_tokens": 1024,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": message},
+                ],
+            },
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            result = await resp.json()
+            if resp.status != 200:
+                raise ValueError(result.get("error", {}).get("message", f"OpenAI API error (HTTP {resp.status})"))
+            return result["choices"][0]["message"]["content"]
+
+
+async def _call_gemini(api_key: str, model: str, system: str, message: str) -> str:
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            url,
+            headers={"Content-Type": "application/json"},
+            json={
+                "system_instruction": {"parts": [{"text": system}]},
+                "contents": [{"parts": [{"text": message}]}],
+                "generationConfig": {"maxOutputTokens": 1024},
+            },
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            result = await resp.json()
+            if resp.status != 200:
+                err = result.get("error", {}).get("message", f"Gemini API error (HTTP {resp.status})")
+                raise ValueError(err)
+            return result["candidates"][0]["content"]["parts"][0]["text"]
+
+
+async def _agent_query_handler(request: web.Request) -> web.Response:
+    """Handle agent chat queries — proxies to user-selected AI provider."""
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+
+    user_message = body.get("message", "").strip()
+    provider = body.get("provider", "anthropic").strip().lower()
+    model = body.get("model", "").strip()
+    api_key = body.get("api_key", "").strip()
+
+    if not user_message:
+        return web.json_response({"error": "empty message"}, status=400)
+
+    # Validate provider
+    if provider not in _AGENT_MODELS:
+        return web.json_response({"error": f"unknown provider: {provider}"}, status=400)
+
+    # Validate model belongs to provider
+    if model not in _AGENT_MODELS[provider]:
+        return web.json_response({"error": f"invalid model for {provider}: {model}"}, status=400)
+
+    # Use provided key, fall back to server env for Anthropic only
+    if not api_key and provider == "anthropic" and ANTHROPIC_API_KEY:
+        api_key = ANTHROPIC_API_KEY
+    if not api_key:
+        return web.json_response({"error": "API key required. Your key is never stored — it's used for this request only."}, status=400)
+
+    system = _build_system_prompt()
+
+    try:
+        if provider == "anthropic":
+            reply = await _call_anthropic(api_key, model, system, user_message)
+        elif provider == "openai":
+            reply = await _call_openai(api_key, model, system, user_message)
+        else:
+            reply = await _call_gemini(api_key, model, system, user_message)
+        return web.json_response({"reply": reply})
+    except asyncio.TimeoutError:
+        return web.json_response({"error": "API timeout — try again or use a faster model"}, status=504)
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=502)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def _agent_models_handler(_request: web.Request) -> web.Response:
+    """Return available models per provider."""
+    return web.json_response(_AGENT_MODELS)
+
+
+# ---------------------------------------------------------------------------
+# Dashboard HTML
+# ---------------------------------------------------------------------------
 
 _DASHBOARD_HTML = """\
 <!DOCTYPE html>
@@ -268,6 +493,14 @@ _DASHBOARD_HTML = """\
   }
   .top-bar-left { display: flex; align-items: center; gap: 1.5rem; }
   .top-bar .sys-label { color: var(--accent); font-weight: 600; letter-spacing: .08em; }
+  .top-bar-nav { display: flex; gap: .3rem; }
+  .top-bar-nav a {
+    color: var(--text-secondary); text-decoration: none; padding: .25rem .6rem;
+    border: 1px solid transparent; border-radius: 2px; font-size: .65rem;
+    letter-spacing: .05em; text-transform: uppercase; transition: all .15s;
+  }
+  .top-bar-nav a:hover { border-color: var(--accent); color: var(--accent); }
+  .top-bar-nav a.active { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
   .pulse-dot {
     width: 6px; height: 6px; border-radius: 50%; background: var(--green);
     display: inline-block; margin-right: .4rem; animation: pulse 2s ease-in-out infinite;
@@ -422,6 +655,10 @@ _DASHBOARD_HTML = """\
     <span><span class="pulse-dot"></span>OPERATIONAL</span>
     <span>WEBHOOK ACTIVE</span>
   </div>
+  <div class="top-bar-nav">
+    <a href="/logs" class="active">DASHBOARD</a>
+    <a href="/agent">AGENT</a>
+  </div>
   <span class="clock" id="clock">--:--:-- UTC</span>
 </div>
 <div class="container">
@@ -549,10 +786,495 @@ load();
 </html>
 """
 
+# ---------------------------------------------------------------------------
+# Agent HTML
+# ---------------------------------------------------------------------------
+
+_AGENT_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>INCIDENT AGENT</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0c0f16; --bg-raised: #141820; --bg-input: #1a1f2b;
+    --bg-hover: #1e2535; --surface: #1c2233;
+    --border: #2a3245; --border-light: #354055;
+    --text: #e2e8f0; --text-secondary: #8994a7; --text-muted: #515d73;
+    --accent: #00d4ff; --accent-dim: rgba(0,212,255,0.1); --accent-border: rgba(0,212,255,0.3);
+    --anthropic: #d97757; --anthropic-bg: rgba(217,119,87,0.08); --anthropic-border: rgba(217,119,87,0.35);
+    --openai: #10a37f; --openai-bg: rgba(16,163,127,0.08); --openai-border: rgba(16,163,127,0.35);
+    --gemini: #7b9cf7; --gemini-bg: rgba(123,156,247,0.08); --gemini-border: rgba(123,156,247,0.35);
+    --green: #34d399; --green-glow: rgba(52,211,153,0.3);
+    --red: #f87171;
+  }
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    background: var(--bg); color: var(--text);
+    min-height: 100vh; display: flex; flex-direction: column;
+  }
+
+  /* --- Top bar --- */
+  .top-bar {
+    background: var(--bg-raised); border-bottom: 1px solid var(--border);
+    padding: .65rem 1.5rem; display: flex; align-items: center; justify-content: space-between;
+    font-size: .75rem; color: var(--text-secondary); flex-shrink: 0;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .top-bar-left { display: flex; align-items: center; gap: 1.2rem; }
+  .top-bar .sys-label { color: var(--accent); font-weight: 600; font-size: .7rem; letter-spacing: .06em; }
+  .top-bar-nav { display: flex; gap: .3rem; }
+  .top-bar-nav a {
+    color: var(--text-secondary); text-decoration: none; padding: .3rem .8rem;
+    border: 1px solid transparent; border-radius: 6px; font-size: .7rem;
+    letter-spacing: .03em; transition: all .15s;
+  }
+  .top-bar-nav a:hover { border-color: var(--border-light); color: var(--text); background: var(--bg-hover); }
+  .top-bar-nav a.active { border-color: var(--accent-border); color: var(--accent); background: var(--accent-dim); }
+  .pulse-dot {
+    width: 7px; height: 7px; border-radius: 50%; background: var(--green);
+    display: inline-block; margin-right: .4rem; animation: pulse 2s ease-in-out infinite;
+    box-shadow: 0 0 8px var(--green-glow);
+  }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+  .clock { font-variant-numeric: tabular-nums; font-family: 'JetBrains Mono', monospace; font-size: .7rem; }
+
+  /* --- Setup panel --- */
+  .setup-panel {
+    flex-shrink: 0; background: var(--bg-raised);
+    border-bottom: 1px solid var(--border); padding: 1.2rem 1.5rem;
+  }
+  .setup-inner { max-width: 920px; margin: 0 auto; }
+  .setup-title {
+    font-size: .65rem; font-weight: 600; color: var(--text-muted);
+    text-transform: uppercase; letter-spacing: .1em; margin-bottom: 1rem;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .setup-steps { display: flex; flex-direction: column; gap: 1rem; }
+  .setup-row { display: flex; gap: 1rem; align-items: flex-end; }
+
+  .step-label {
+    display: flex; align-items: center; gap: .5rem; margin-bottom: .6rem;
+  }
+  .step-num {
+    width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center;
+    justify-content: center; font-size: .6rem; font-weight: 700;
+    background: var(--accent-dim); color: var(--accent); border: 1px solid var(--accent-border);
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .step-label span {
+    font-size: .75rem; font-weight: 600; color: var(--text);
+  }
+
+  /* Provider cards */
+  .provider-cards { display: flex; gap: .5rem; flex-wrap: wrap; }
+  .provider-card {
+    display: flex; align-items: center; gap: .6rem;
+    padding: .65rem 1.1rem; border: 2px solid var(--border); border-radius: 10px;
+    cursor: pointer; transition: all .2s; background: var(--bg-input);
+  }
+  .provider-card:hover { border-color: var(--border-light); background: var(--bg-hover); }
+  .provider-card.sel-anthropic { border-color: var(--anthropic-border); background: var(--anthropic-bg); }
+  .provider-card.sel-openai { border-color: var(--openai-border); background: var(--openai-bg); }
+  .provider-card.sel-gemini { border-color: var(--gemini-border); background: var(--gemini-bg); }
+  .provider-card svg { width: 22px; height: 22px; flex-shrink: 0; }
+  .provider-card .pname { font-size: .8rem; font-weight: 600; }
+  .pname.c-anthropic { color: var(--anthropic); }
+  .pname.c-openai { color: var(--openai); }
+  .pname.c-gemini { color: var(--gemini); }
+
+  /* Model select */
+  .model-select {
+    width: 100%; background: var(--bg-input); border: 2px solid var(--border);
+    border-radius: 10px; color: var(--text); font-family: inherit;
+    font-size: .8rem; padding: .65rem .85rem; outline: none;
+    cursor: pointer; transition: border-color .2s; appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%238994a7'%3E%3Cpath d='M6 8.5L1.5 4h9z'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right .8rem center;
+  }
+  .model-select:focus { border-color: var(--accent); }
+
+  /* API key input */
+  .key-wrapper { position: relative; }
+  .key-input {
+    width: 100%; background: var(--bg-input); border: 2px solid var(--border);
+    border-radius: 10px; color: var(--text); font-family: 'JetBrains Mono', monospace;
+    font-size: .8rem; padding: .65rem .85rem; padding-right: 2.5rem;
+    outline: none; transition: border-color .2s;
+  }
+  .key-input:focus { border-color: var(--accent); }
+  .key-input::placeholder { color: var(--text-muted); font-family: 'Inter', sans-serif; }
+  .key-toggle {
+    position: absolute; right: .6rem; top: 50%; transform: translateY(-50%);
+    background: none; border: none; color: var(--text-muted); cursor: pointer;
+    padding: .2rem; display: flex; transition: color .15s;
+  }
+  .key-toggle:hover { color: var(--text); }
+
+  /* Security badge */
+  .security-badge {
+    display: inline-flex; align-items: center; gap: .45rem; margin-top: .8rem;
+    padding: .5rem .85rem; border-radius: 8px;
+    background: rgba(52,211,153,0.06); border: 1px solid rgba(52,211,153,0.2);
+  }
+  .security-badge svg { flex-shrink: 0; }
+  .security-badge span {
+    font-size: .72rem; color: var(--green); line-height: 1.5;
+  }
+
+  /* --- Chat area --- */
+  .chat-wrap {
+    flex: 1; max-width: 920px; width: 100%; margin: 0 auto;
+    display: flex; flex-direction: column; padding: 1rem 1.5rem; overflow: hidden;
+  }
+
+  .messages {
+    flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: .8rem;
+    padding: .5rem 0 1rem; scrollbar-width: thin; scrollbar-color: var(--border) transparent;
+  }
+  .messages::-webkit-scrollbar { width: 5px; }
+  .messages::-webkit-scrollbar-track { background: transparent; }
+  .messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  .msg { display: flex; gap: .7rem; max-width: 100%; }
+  .msg-icon {
+    width: 32px; height: 32px; border-radius: 8px; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: .6rem; font-weight: 700; font-family: 'JetBrains Mono', monospace;
+  }
+  .msg-user .msg-icon { background: var(--surface); color: var(--text-secondary); border: 1px solid var(--border); }
+  .msg-agent .msg-icon.ic-anthropic { background: var(--anthropic-bg); color: var(--anthropic); border: 1px solid var(--anthropic-border); }
+  .msg-agent .msg-icon.ic-openai { background: var(--openai-bg); color: var(--openai); border: 1px solid var(--openai-border); }
+  .msg-agent .msg-icon.ic-gemini { background: var(--gemini-bg); color: var(--gemini); border: 1px solid var(--gemini-border); }
+  .msg-agent .msg-icon.ic-system { background: var(--accent-dim); color: var(--accent); border: 1px solid var(--accent-border); }
+
+  .msg-content { flex: 1; min-width: 0; }
+  .msg-bubble {
+    background: var(--bg-raised); border: 1px solid var(--border); border-radius: 12px;
+    padding: .8rem 1rem; font-size: .82rem; line-height: 1.7;
+  }
+  .msg-agent .msg-bubble { border-color: var(--border); }
+  .msg-bubble p { margin-bottom: .5rem; }
+  .msg-bubble p:last-child { margin-bottom: 0; }
+  .msg-bubble code {
+    background: var(--bg-input); padding: .15rem .4rem; border-radius: 4px;
+    font-size: .75rem; color: var(--accent); font-family: 'JetBrains Mono', monospace;
+  }
+  .msg-bubble pre {
+    background: var(--bg-input); border: 1px solid var(--border); border-radius: 8px;
+    padding: .7rem .9rem; margin: .5rem 0; overflow-x: auto; font-size: .72rem;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .msg-bubble pre code { background: none; padding: 0; }
+  .msg-bubble strong { color: var(--text); font-weight: 600; }
+  .msg-bubble ul, .msg-bubble ol { padding-left: 1.3rem; margin: .4rem 0; }
+  .msg-bubble li { margin-bottom: .25rem; }
+  .msg-bubble h1, .msg-bubble h2, .msg-bubble h3 {
+    color: var(--accent); font-size: .85rem; margin: .7rem 0 .3rem;
+  }
+  .msg-meta {
+    display: flex; gap: .6rem; align-items: center; margin-top: .3rem;
+    font-size: .65rem; color: var(--text-muted);
+  }
+
+  .typing-dots { display: flex; align-items: center; gap: .35rem; padding: .6rem 0; }
+  .typing-dots span {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--accent); opacity: .25;
+    animation: bounce 1.4s ease-in-out infinite;
+  }
+  .typing-dots span:nth-child(2) { animation-delay: .2s; }
+  .typing-dots span:nth-child(3) { animation-delay: .4s; }
+  @keyframes bounce { 0%,100% { opacity: .25; transform: translateY(0); } 50% { opacity: 1; transform: translateY(-3px); } }
+
+  /* --- Suggestions --- */
+  .suggestions { display: flex; gap: .4rem; flex-wrap: wrap; margin-bottom: .6rem; }
+  .suggestions button {
+    background: var(--bg-raised); border: 1px solid var(--border); color: var(--text-secondary);
+    padding: .4rem .8rem; border-radius: 8px; cursor: pointer;
+    font-family: inherit; font-size: .72rem; transition: all .15s;
+  }
+  .suggestions button:hover { border-color: var(--accent-border); color: var(--accent); background: var(--accent-dim); }
+
+  /* --- Input bar --- */
+  .input-bar {
+    flex-shrink: 0; display: flex; gap: .5rem;
+    background: var(--bg-raised); border: 1px solid var(--border); border-radius: 12px;
+    padding: .4rem .4rem .4rem .9rem; align-items: center;
+    transition: border-color .2s;
+  }
+  .input-bar:focus-within { border-color: var(--accent-border); }
+  .input-bar input {
+    flex: 1; background: none; border: none; color: var(--text);
+    font-family: inherit; font-size: .85rem; outline: none; padding: .4rem 0;
+  }
+  .input-bar input::placeholder { color: var(--text-muted); }
+  .input-bar button {
+    background: var(--accent); border: none; color: var(--bg);
+    padding: .5rem 1.2rem; border-radius: 8px; font-family: 'JetBrains Mono', monospace;
+    font-size: .72rem; font-weight: 600; cursor: pointer; letter-spacing: .05em;
+    transition: all .15s; white-space: nowrap;
+  }
+  .input-bar button:hover { filter: brightness(1.15); }
+  .input-bar button:disabled { opacity: .35; cursor: not-allowed; }
+
+  @media (max-width: 768px) {
+    .setup-row { flex-direction: column; }
+    .chat-wrap { padding: .8rem; }
+  }
+</style>
+</head>
+<body>
+<div class="top-bar">
+  <div class="top-bar-left">
+    <span class="sys-label">INCIDENT MONITOR</span>
+    <span><span class="pulse-dot"></span>ONLINE</span>
+  </div>
+  <div class="top-bar-nav">
+    <a href="/logs">Dashboard</a>
+    <a href="/agent" class="active">Agent</a>
+  </div>
+  <span class="clock" id="clock">--:--:-- UTC</span>
+</div>
+
+<div class="setup-panel">
+  <div class="setup-inner">
+    <div class="setup-title">Configure your AI model</div>
+    <div class="setup-steps">
+      <div>
+        <div class="step-label"><div class="step-num">1</div><span>Choose Provider</span></div>
+        <div class="provider-cards" id="providerCards">
+          <div class="provider-card sel-anthropic" data-provider="anthropic" onclick="selectProvider('anthropic')">
+            <svg viewBox="0 0 24 24" fill="none"><path d="M13.827 3L22 21h-4.586l-1.637-3.6H9.14L16.277 3h-2.45zm-.282 4.4L9.86 14.85h6.372L13.545 7.4z" fill="var(--anthropic)"/><path d="M7.723 3H3L11.173 21h4.586L7.723 3z" fill="var(--anthropic)"/></svg>
+            <span class="pname c-anthropic">Anthropic</span>
+          </div>
+          <div class="provider-card" data-provider="openai" onclick="selectProvider('openai')">
+            <svg viewBox="0 0 24 24" fill="none"><path d="M22.282 9.821a5.985 5.985 0 0 0-.516-4.91 6.046 6.046 0 0 0-6.51-2.9A6.065 6.065 0 0 0 4.981 4.18a5.998 5.998 0 0 0-3.998 2.9 6.042 6.042 0 0 0 .743 7.097 5.98 5.98 0 0 0 .51 4.911 6.051 6.051 0 0 0 6.515 2.9A5.985 5.985 0 0 0 13.26 24a6.056 6.056 0 0 0 5.772-4.206 5.99 5.99 0 0 0 3.997-2.9 6.056 6.056 0 0 0-.747-7.073zM13.26 22.43a4.476 4.476 0 0 1-2.876-1.04l.141-.081 4.779-2.758a.795.795 0 0 0 .392-.681v-6.737l2.02 1.168a.071.071 0 0 1 .038.052v5.583a4.504 4.504 0 0 1-4.494 4.494zM3.6 18.304a4.47 4.47 0 0 1-.535-3.014l.142.085 4.783 2.759a.771.771 0 0 0 .78 0l5.843-3.369v2.332a.08.08 0 0 1-.033.062L9.74 19.95a4.5 4.5 0 0 1-6.14-1.646zM2.34 7.896a4.485 4.485 0 0 1 2.366-1.973V11.6a.766.766 0 0 0 .388.676l5.815 3.355-2.02 1.168a.076.076 0 0 1-.071 0l-4.83-2.786A4.504 4.504 0 0 1 2.34 7.872zm16.597 3.855l-5.833-3.387L15.119 7.2a.076.076 0 0 1 .071 0l4.83 2.791a4.494 4.494 0 0 1-.676 8.105v-5.678a.79.79 0 0 0-.407-.667zm2.01-3.023l-.141-.085-4.774-2.782a.776.776 0 0 0-.785 0L9.409 9.23V6.897a.066.066 0 0 1 .028-.061l4.83-2.787a4.5 4.5 0 0 1 6.68 4.66zm-12.64 4.135l-2.02-1.164a.08.08 0 0 1-.038-.057V6.075a4.5 4.5 0 0 1 7.375-3.453l-.142.08L8.704 5.46a.795.795 0 0 0-.393.681zm1.097-2.365l2.602-1.5 2.607 1.5v2.999l-2.597 1.5-2.607-1.5z" fill="var(--openai)"/></svg>
+            <span class="pname c-openai">OpenAI</span>
+          </div>
+          <div class="provider-card" data-provider="gemini" onclick="selectProvider('gemini')">
+            <svg viewBox="0 0 24 24" fill="none"><path d="M12 24A14.304 14.304 0 0 0 0 12 14.304 14.304 0 0 0 12 0a14.304 14.304 0 0 0 0 12 14.304 14.304 0 0 0 0 12z" fill="url(#gem)"/><defs><linearGradient id="gem" x1="0" y1="12" x2="24" y2="12"><stop stop-color="#4285f4"/><stop offset=".5" stop-color="#9b72cb"/><stop offset="1" stop-color="#d96570"/></linearGradient></defs></svg>
+            <span class="pname c-gemini">Gemini</span>
+          </div>
+        </div>
+      </div>
+      <div class="setup-row">
+        <div style="flex:1">
+          <div class="step-label"><div class="step-num">2</div><span>Select Model</span></div>
+          <select class="model-select" id="modelSelect"></select>
+        </div>
+        <div style="flex:1.5">
+          <div class="step-label"><div class="step-num">3</div><span>Enter API Key</span></div>
+          <div class="key-wrapper">
+            <input type="password" class="key-input" id="apiKeyInput" placeholder="Paste your API key here..." autocomplete="off">
+            <button class="key-toggle" onclick="toggleKey()" title="Show/hide key">
+              <svg id="eyeIcon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="security-badge">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+      <span>Your key lives only in this browser tab's memory. It's sent directly to the provider API and never logged, stored, or visible to our server. Closing the tab erases it.</span>
+    </div>
+  </div>
+</div>
+
+<div class="chat-wrap">
+  <div class="messages" id="messages">
+    <div class="msg msg-agent">
+      <div class="msg-icon ic-system">AG</div>
+      <div class="msg-content">
+        <div class="msg-bubble">
+          <p><strong>Incident analysis agent ready.</strong> Configure your AI model above, then ask me anything about your monitored services.</p>
+          <p>Example queries:</p>
+          <ul>
+            <li><strong>What broke recently?</strong> &mdash; latest incidents across all services</li>
+            <li><strong>Show active incidents</strong> &mdash; unresolved issues right now</li>
+            <li><strong>Summarize OpenAI outages</strong> &mdash; filter by service</li>
+            <li><strong>Incident timeline</strong> &mdash; chronological breakdown</li>
+          </ul>
+        </div>
+        <div class="msg-meta"><span>system</span></div>
+      </div>
+    </div>
+  </div>
+  <div class="suggestions">
+    <button onclick="ask('What are the active incidents right now?')">Active incidents</button>
+    <button onclick="ask('What broke in the last 24 hours?')">Recent outages</button>
+    <button onclick="ask('Give me a summary of all services')">Service summary</button>
+    <button onclick="ask('Which service has had the most incidents?')">Worst offender</button>
+    <button onclick="ask('Show the incident timeline for today')">Today's timeline</button>
+  </div>
+  <div class="input-bar">
+    <input type="text" id="input" placeholder="Ask about incidents..." autocomplete="off">
+    <button id="send" onclick="send()">QUERY</button>
+  </div>
+</div>
+
+<script>
+// --- Clock ---
+function tickClock() {
+  document.getElementById("clock").textContent = new Date().toISOString().slice(11,19) + " UTC";
+}
+setInterval(tickClock, 1000); tickClock();
+
+// --- Key visibility toggle ---
+function toggleKey() {
+  var inp = document.getElementById("apiKeyInput");
+  inp.type = inp.type === "password" ? "text" : "password";
+}
+
+// --- Provider / Model ---
+var models = {
+  anthropic: [
+    {id:"claude-haiku-4-5-20251001", name:"Haiku 4.5", tier:"Budget", price:"$0.80 / 1M tokens"},
+    {id:"claude-sonnet-4-5-20250514", name:"Sonnet 4.5", tier:"Balanced", price:"$3 / 1M tokens"},
+    {id:"claude-opus-4-0-20250514", name:"Opus 4", tier:"Premium", price:"$15 / 1M tokens"}
+  ],
+  openai: [
+    {id:"gpt-4o-mini", name:"GPT-4o Mini", tier:"Budget", price:"$0.15 / 1M tokens"},
+    {id:"gpt-4o", name:"GPT-4o", tier:"Balanced", price:"$2.50 / 1M tokens"},
+    {id:"o3-mini", name:"o3-mini", tier:"Reasoning", price:"$1.10 / 1M tokens"}
+  ],
+  gemini: [
+    {id:"gemini-2.0-flash-lite", name:"Flash-Lite 2.0", tier:"Budget", price:"Free tier"},
+    {id:"gemini-2.0-flash", name:"Flash 2.0", tier:"Balanced", price:"$0.10 / 1M tokens"},
+    {id:"gemini-2.5-pro-preview-06-05", name:"Gemini 2.5 Pro", tier:"Premium", price:"$1.25 / 1M tokens"}
+  ]
+};
+var iconLabels = {anthropic:"CL", openai:"OA", gemini:"GE"};
+var currentProvider = "anthropic";
+
+function selectProvider(p) {
+  currentProvider = p;
+  document.querySelectorAll(".provider-card").forEach(function(c) {
+    c.className = "provider-card" + (c.dataset.provider === p ? " sel-" + p : "");
+  });
+  var sel = document.getElementById("modelSelect");
+  sel.innerHTML = "";
+  models[p].forEach(function(m) {
+    var opt = document.createElement("option");
+    opt.value = m.id;
+    opt.textContent = m.name + "  —  " + m.tier + "  (" + m.price + ")";
+    sel.appendChild(opt);
+  });
+  document.getElementById("apiKeyInput").value = sessionStorage.getItem("agent_key_" + p) || "";
+}
+document.getElementById("apiKeyInput").addEventListener("input", function() {
+  sessionStorage.setItem("agent_key_" + currentProvider, this.value);
+});
+selectProvider("anthropic");
+
+// --- Markdown ---
+function md(text) {
+  return text
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/```([\\s\\S]*?)```/g, function(m,c){ return "<pre><code>"+c.trim()+"</code></pre>"; })
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\\*\\*(.+?)\\*\\*/g, "<strong>$1</strong>")
+    .replace(/^### (.+)$/gm, "<h3>$1</h3>")
+    .replace(/^## (.+)$/gm, "<h2>$1</h2>")
+    .replace(/^# (.+)$/gm, "<h1>$1</h1>")
+    .replace(/^[\\-\\*] (.+)$/gm, "<li>$1</li>")
+    .replace(/(<li>.*<\\/li>)/gs, "<ul>$1</ul>")
+    .replace(/<\\/ul>\\s*<ul>/g, "")
+    .split("\\n").map(function(l){
+      l=l.trim();
+      if(!l||l.startsWith("<h")||l.startsWith("<pre")||l.startsWith("<ul")||l.startsWith("<li")||l.startsWith("<ol")) return l;
+      return "<p>"+l+"</p>";
+    }).join("\\n");
+}
+
+// --- Chat ---
+var messagesDiv = document.getElementById("messages");
+var inputEl = document.getElementById("input");
+var sendBtn = document.getElementById("send");
+
+function addMessage(role, content, modelName) {
+  var div = document.createElement("div");
+  div.className = "msg msg-" + role;
+  var time = new Date().toISOString().slice(11,19) + " UTC";
+  var bodyHtml = role === "agent" ? md(content) : "<p>" + content.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;") + "</p>";
+  if (role === "agent") {
+    var icClass = "ic-" + currentProvider;
+    var label = iconLabels[currentProvider] || "AG";
+    var meta = '<span>' + time + '</span>' + (modelName ? '<span>via ' + modelName + '</span>' : '');
+    div.innerHTML = '<div class="msg-icon '+icClass+'">' + label + '</div><div class="msg-content"><div class="msg-bubble">' + bodyHtml + '</div><div class="msg-meta">' + meta + '</div></div>';
+  } else {
+    div.innerHTML = '<div class="msg-icon">YOU</div><div class="msg-content"><div class="msg-bubble">' + bodyHtml + '</div><div class="msg-meta"><span>' + time + '</span></div></div>';
+  }
+  messagesDiv.appendChild(div);
+  messagesDiv.scrollTop = messagesDiv.scrollHeight;
+}
+
+function showTyping() {
+  var div = document.createElement("div");
+  div.id = "typing"; div.className = "msg msg-agent";
+  var icClass = "ic-" + currentProvider;
+  var label = iconLabels[currentProvider] || "AG";
+  div.innerHTML = '<div class="msg-icon '+icClass+'">' + label + '</div><div class="typing-dots"><span></span><span></span><span></span></div>';
+  messagesDiv.appendChild(div);
+  messagesDiv.scrollTop = messagesDiv.scrollHeight;
+}
+function hideTyping() { var el = document.getElementById("typing"); if(el) el.remove(); }
+
+async function send() {
+  var msg = inputEl.value.trim();
+  if (!msg) return;
+  var apiKey = document.getElementById("apiKeyInput").value.trim();
+  if (!apiKey) {
+    addMessage("agent", "Please enter your API key in **Step 3** above. Your key never leaves your browser except to call the provider API directly through our server.");
+    return;
+  }
+  var model = document.getElementById("modelSelect").value;
+  var modelObj = models[currentProvider].find(function(m){ return m.id === model; });
+  var modelName = (modelObj ? modelObj.name : model);
+
+  inputEl.value = "";
+  sendBtn.disabled = true;
+  addMessage("user", msg);
+  showTyping();
+
+  try {
+    var res = await fetch("/api/agent", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ message: msg, provider: currentProvider, model: model, api_key: apiKey })
+    });
+    var data = await res.json();
+    hideTyping();
+    addMessage("agent", data.error ? "Error: " + data.error : data.reply, modelName);
+  } catch(e) {
+    hideTyping();
+    addMessage("agent", "Connection error: " + e.message);
+  }
+  sendBtn.disabled = false;
+  inputEl.focus();
+}
+
+function ask(q) { inputEl.value = q; send(); }
+inputEl.addEventListener("keydown", function(e) {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+inputEl.focus();
+</script>
+</body>
+</html>
+"""
+
 
 async def _dashboard_handler(_request: web.Request) -> web.Response:
     html = _DASHBOARD_HTML.replace("{max_recent}", str(MAX_RECENT))
     return web.Response(text=html, content_type="text/html")
+
+
+async def _agent_handler(_request: web.Request) -> web.Response:
+    return web.Response(text=_AGENT_HTML, content_type="text/html")
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +1289,10 @@ async def main() -> None:
     app.router.add_get("/health", _health_handler)
     app.router.add_get("/logs", _dashboard_handler)
     app.router.add_get("/api/incidents", _api_incidents_handler)
+    app.router.add_get("/api/autoconfirm", _api_autoconfirm_handler)
+    app.router.add_post("/api/agent", _agent_query_handler)
+    app.router.add_get("/api/agent/models", _agent_models_handler)
+    app.router.add_get("/agent", _agent_handler)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -576,7 +1302,10 @@ async def main() -> None:
     _log_stderr("  POST /webhook/email  — SendGrid Inbound Parse endpoint")
     _log_stderr("  GET  /health         — health check")
     _log_stderr("  GET  /logs           — incident dashboard")
+    _log_stderr("  GET  /agent          — AI incident agent")
     _log_stderr("  GET  /api/incidents  — incidents JSON API")
+    _log_stderr("  POST /api/agent      — agent query API (multi-provider)")
+    _log_stderr("  [agent] providers: Anthropic, OpenAI, Gemini — user supplies own API key")
 
     # Graceful shutdown
     shutdown = asyncio.Event()
