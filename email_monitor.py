@@ -726,10 +726,34 @@ _DASHBOARD_HTML = """\
   }
 
   @media (max-width: 768px) {
-    .stats-row { grid-template-columns: repeat(2, 1fr); }
-    .container { padding: .8rem; }
-    table { font-size: .65rem; }
+    .top-bar { padding: .5rem .8rem; font-size: .6rem; flex-wrap: wrap; gap: .4rem; }
+    .top-bar-left { gap: .8rem; }
+    .top-bar-left span:last-of-type { display: none; }
+    .container { padding: .6rem .8rem; }
+    .header { flex-direction: column; gap: .5rem; align-items: flex-start; }
+    .header h1 { font-size: .85rem; }
+    .header h1 span { display: none; }
+    .header-meta { text-align: left; font-size: .55rem; }
+    .stats-row { grid-template-columns: repeat(2, 1fr); gap: .5rem; }
+    .stat-card { padding: .6rem .7rem; }
+    .stat-value { font-size: 1.2rem; }
+    .filters { padding: .5rem .7rem; gap: .3rem; }
+    .filters button { font-size: .55rem; padding: .2rem .5rem; }
+    table { font-size: .6rem; display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    thead th { padding: .4rem .5rem; font-size: .5rem; white-space: nowrap; }
+    tbody td { padding: .4rem .5rem; }
     .detail-cell { display: none; }
+    .page-tag { font-size: .5rem; padding: .1rem .3rem; }
+    .badge { font-size: .5rem; padding: .15rem .4rem; }
+    .panel-header { padding: .5rem .7rem; font-size: .55rem; }
+    .top-bar-nav a.agent-link .arrow-wrap { bottom: -16px; }
+    .top-bar-nav a.agent-link .arrow-wrap svg { width: 10px; height: 7px; }
+  }
+  @media (max-width: 400px) {
+    .stats-row { grid-template-columns: 1fr 1fr; gap: .4rem; }
+    .stat-label { font-size: .45rem; }
+    .stat-value { font-size: 1rem; }
+    .top-bar .clock { display: none; }
   }
 </style>
 </head>
@@ -1117,8 +1141,37 @@ _AGENT_HTML = """\
   .input-bar button:disabled { opacity: .35; cursor: not-allowed; }
 
   @media (max-width: 768px) {
-    .setup-row { flex-direction: column; }
-    .chat-wrap { padding: .8rem; }
+    .top-bar { padding: .5rem .8rem; font-size: .65rem; flex-wrap: wrap; gap: .4rem; }
+    .top-bar-left { gap: .8rem; }
+    .setup-panel { padding: .8rem; }
+    .setup-title { font-size: .55rem; margin-bottom: .7rem; }
+    .provider-cards { flex-wrap: wrap; gap: .4rem; }
+    .provider-card { padding: .5rem .7rem; }
+    .provider-card svg { width: 18px; height: 18px; }
+    .provider-card .pname { font-size: .7rem; }
+    .free-badge { font-size: .45rem; }
+    .setup-row { flex-direction: column; gap: .8rem; }
+    .model-select { font-size: .72rem; padding: .55rem .7rem; }
+    .key-input { font-size: .72rem; padding: .55rem .7rem; }
+    .security-badge { margin-top: .6rem; padding: .4rem .6rem; }
+    .security-badge span { font-size: .6rem; }
+    .chat-wrap { padding: .6rem .8rem; }
+    .msg-icon { width: 26px; height: 26px; font-size: .5rem; border-radius: 6px; }
+    .msg-bubble { padding: .6rem .75rem; font-size: .75rem; border-radius: 10px; }
+    .suggestions { gap: .3rem; }
+    .suggestions button { font-size: .6rem; padding: .3rem .6rem; }
+    .input-bar { padding: .3rem .3rem .3rem .7rem; border-radius: 10px; }
+    .input-bar input { font-size: .78rem; }
+    .input-bar button { padding: .45rem .8rem; font-size: .65rem; border-radius: 6px; }
+    .step-label span { font-size: .7rem; }
+    .step-num { width: 20px; height: 20px; font-size: .55rem; }
+  }
+  @media (max-width: 400px) {
+    .top-bar .clock { display: none; }
+    .provider-card .pname { font-size: .6rem; }
+    .provider-card svg { width: 16px; height: 16px; }
+    .msg-bubble { font-size: .7rem; }
+    .msg { gap: .5rem; }
   }
 </style>
 </head>
