@@ -37,6 +37,20 @@ _SUBJECT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Broader patterns for real Statuspage emails
+# e.g. "GitHub Incident - Incident with Webhooks - 6 March 2026"
+# e.g. "Claude Incident - Elevated TCP three-way handshake failures on api.anthropic.com - 6 March 2026"
+_INCIDENT_SUBJECT_RE = re.compile(
+    r"^(.+?)\s+Incident\s*[-–—]\s*(.+?)(?:\s*[-–—]\s*\d{1,2}\s+\w+\s+\d{4})?$",
+    re.IGNORECASE,
+)
+
+# Status keywords to detect in the email body text (order matters — more specific first)
+_BODY_STATUS_RE = re.compile(
+    r"\b(Incident resolved|Incident identified|New incident|Investigating|Identified|Monitoring|Resolved|update has been posted)\b",
+    re.IGNORECASE,
+)
+
 # Pattern to detect subscription confirmation emails
 _CONFIRM_RE = re.compile(r"confirm your subscription", re.IGNORECASE)
 # Extract confirmation URLs from email body
@@ -126,16 +140,24 @@ class EmailIncidentParser:
 
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
+        # Try the strict [Page] Status - Title pattern first
         match = _SUBJECT_RE.search(subject)
         if match:
             page_name = match.group(1).strip()
             status = match.group(2).strip()
             title = match.group(3).strip()
         else:
-            # Fallback: use raw subject, derive page from sender
-            page_name = self._page_from_sender(from_addr, subject)
-            status = "unknown"
-            title = subject.strip()
+            # Try the broader "Page Incident - Title" pattern
+            inc_match = _INCIDENT_SUBJECT_RE.search(subject)
+            if inc_match:
+                page_name = inc_match.group(1).strip()
+                title = inc_match.group(2).strip()
+            else:
+                page_name = self._page_from_sender(from_addr, subject)
+                title = subject.strip()
+
+            # Extract status from the email body
+            status = self._status_from_body(text_body)
 
         return {
             "timestamp": now,
@@ -146,6 +168,36 @@ class EmailIncidentParser:
             "incident": title,
             "detail": (text_body or "").strip(),
         }
+
+    @staticmethod
+    def _status_from_body(text_body: str) -> str:
+        """Extract incident status from email body text."""
+        if not text_body:
+            return "unknown"
+        body_match = _BODY_STATUS_RE.search(text_body)
+        if body_match:
+            raw = body_match.group(1).lower()
+            if "resolved" in raw:
+                return "resolved"
+            if "investigating" in raw or "new incident" in raw:
+                return "investigating"
+            if "identified" in raw:
+                return "identified"
+            if "monitoring" in raw:
+                return "monitoring"
+            if "update" in raw:
+                return "update"
+        # Second pass: scan for common phrases
+        lower = text_body.lower()
+        if "fix has been deployed" in lower or "fix for the issue" in lower or "deployed a fix" in lower:
+            return "identified"
+        if "we are investigating" in lower or "currently investigating" in lower:
+            return "investigating"
+        if "has been restored" in lower or "back to normal" in lower or "fully restored" in lower:
+            return "resolved"
+        if "continue to monitor" in lower or "continue working on" in lower or "mitigations to restore" in lower:
+            return "monitoring"
+        return "update"
 
     @staticmethod
     def _page_from_sender(from_addr: str, subject: str) -> str:
@@ -698,6 +750,8 @@ _DASHBOARD_HTML = """\
   .badge-monitoring::before { background: var(--blue); }
   .badge-resolved { background: var(--green-dim); color: var(--green); }
   .badge-resolved::before { background: var(--green); box-shadow: 0 0 6px var(--green-glow); }
+  .badge-update { background: var(--blue-dim); color: var(--blue); }
+  .badge-update::before { background: var(--blue); }
   .badge-unknown { background: var(--gray-dim); color: var(--gray); }
   .badge-unknown::before { background: var(--gray); }
 
@@ -802,7 +856,7 @@ _DASHBOARD_HTML = """\
 <script>
 let activeFilter = "";
 function statusClass(s) {
-  var m = {investigating:"investigating",identified:"identified",monitoring:"monitoring",resolved:"resolved"};
+  var m = {investigating:"investigating",identified:"identified",monitoring:"monitoring",resolved:"resolved",update:"update"};
   return m[s] || "unknown";
 }
 function esc(s) { var d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
