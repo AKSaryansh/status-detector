@@ -310,15 +310,16 @@ _AGENT_MODELS = {
     },
     "groq": {
         "llama-3.3-70b-versatile": "Llama 3.3 70B",
-        "gemma2-9b-it": "Gemma 2 9B",
-        "mixtral-8x7b-32768": "Mixtral 8x7B",
+        "llama-3.1-8b-instant": "Llama 3.1 8B",
+        "llama-3.2-3b-preview": "Llama 3.2 3B",
     },
 }
 
 
-def _build_system_prompt() -> str:
+def _build_system_prompt(compact: bool = False) -> str:
     incidents = list(reversed(_recent_records))
-    incident_json = json.dumps(incidents[:100], indent=2, default=str)
+    limit = 30 if compact else 100
+    incident_json = json.dumps(incidents[:limit], default=str) if compact else json.dumps(incidents[:limit], indent=2, default=str)
     return f"""You are an incident analysis agent for a status page monitoring system. You have access to the latest incident data ingested from email notifications from services like GitHub, AWS, Stripe, OpenAI, Vercel, Claude, Datadog, etc.
 
 Your job is to answer questions about these incidents concisely and technically. You can:
@@ -331,7 +332,7 @@ Your job is to answer questions about these incidents concisely and technically.
 
 Be direct, technical, and use short responses. Format with markdown. If the data doesn't contain what the user asks about, say so clearly.
 
-Current incident data ({len(incidents)} records):
+Current incident data ({len(incidents)} records, showing {min(limit, len(incidents))}):
 ```json
 {incident_json}
 ```"""
@@ -457,7 +458,7 @@ async def _agent_query_handler(request: web.Request) -> web.Response:
     if not api_key:
         return web.json_response({"error": "API key required. Your key is never stored — it's used for this request only."}, status=400)
 
-    system = _build_system_prompt()
+    system = _build_system_prompt(compact=(provider == "groq"))
 
     try:
         if provider == "anthropic":
@@ -1300,8 +1301,8 @@ var models = {
   ],
   groq: [
     {id:"llama-3.3-70b-versatile", name:"Llama 3.3 70B", tier:"Free", price:"Free (rate limited)"},
-    {id:"gemma2-9b-it", name:"Gemma 2 9B", tier:"Free", price:"Free (rate limited)"},
-    {id:"mixtral-8x7b-32768", name:"Mixtral 8x7B", tier:"Free", price:"Free (rate limited)"}
+    {id:"llama-3.1-8b-instant", name:"Llama 3.1 8B", tier:"Free", price:"Free (rate limited)"},
+    {id:"llama-3.2-3b-preview", name:"Llama 3.2 3B", tier:"Free", price:"Free (rate limited)"}
   ]
 };
 var iconLabels = {anthropic:"CL", openai:"OA", gemini:"GE", groq:"GQ"};
